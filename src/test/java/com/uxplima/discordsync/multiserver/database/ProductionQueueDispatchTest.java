@@ -14,6 +14,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -72,7 +73,10 @@ class ProductionQueueDispatchTest {
             Method poll = MultiServerHookPlugin.class.getDeclaredMethod("pollCommandQueue");
             poll.setAccessible(true);
             poll.invoke(plugin);
-            Thread.sleep(50L);
+            try (Connection expiredClaim = DriverManager.getConnection(DB_URL);
+                 Statement statement = expiredClaim.createStatement()) {
+                statement.executeUpdate("UPDATE uxm_network_commands SET claim_expires_at = 0");
+            }
             poll.invoke(plugin);
 
             assertEquals(1, mainTasks.size(), "the in-flight production batch must block reclaim");
