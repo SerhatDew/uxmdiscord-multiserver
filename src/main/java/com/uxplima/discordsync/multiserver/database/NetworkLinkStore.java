@@ -15,14 +15,22 @@ import java.util.UUID;
  * Shared verification codes and durable delivery of link effects to the origin server.
  */
 public final class NetworkLinkStore {
+    private static final long DEFAULT_CLAIM_LEASE_MILLIS = 30000L;
     private final ConnectionSupplier connectionSupplier;
     private final boolean globalRewards;
+    private final String claimOwner = UUID.randomUUID().toString();
+    private final long claimLeaseMillis;
 
     public record Delivery(String code, LinkedAccount account, boolean previouslyLinked) {}
 
     public NetworkLinkStore(ConnectionSupplier connectionSupplier, boolean globalRewards) {
+        this(connectionSupplier, globalRewards, DEFAULT_CLAIM_LEASE_MILLIS);
+    }
+
+    NetworkLinkStore(ConnectionSupplier connectionSupplier, boolean globalRewards, long claimLeaseMillis) {
         this.connectionSupplier = connectionSupplier;
         this.globalRewards = globalRewards;
+        this.claimLeaseMillis = claimLeaseMillis;
     }
 
     public void createTables() throws SQLException {
@@ -39,11 +47,14 @@ public final class NetworkLinkStore {
                     + "linked_at BIGINT NOT NULL DEFAULT 0, "
                     + "delivered SMALLINT NOT NULL DEFAULT 0, "
                     + "previously_linked SMALLINT NOT NULL DEFAULT 0, "
+                    + "delivery_owner VARCHAR(36), "
+                    + "delivery_claim_token VARCHAR(36), "
+                    + "delivery_claim_expires_at BIGINT NOT NULL DEFAULT 0, "
                     + "INDEX idx_netlink_server (server), "
                     + "INDEX idx_netlink_uuid (minecraft_uuid), "
                     + "INDEX idx_netlink_expires (expires_at))");
         } catch (SQLException e) {
-            // Some databases might fail with inline INDEX syntax, fallback without inline indices
+            // Some databases might fail with inline INDEX syntax, fallback without inline indices.
             if (e.getMessage() != null && e.getMessage().toLowerCase().contains("syntax")) {
                 try (Connection connection = this.connectionSupplier.get();
                      Statement statement = connection.createStatement()) {
@@ -57,10 +68,29 @@ public final class NetworkLinkStore {
                             + "discord_username VARCHAR(100), "
                             + "linked_at BIGINT NOT NULL DEFAULT 0, "
                             + "delivered SMALLINT NOT NULL DEFAULT 0, "
-                            + "previously_linked SMALLINT NOT NULL DEFAULT 0)");
+                            + "previously_linked SMALLINT NOT NULL DEFAULT 0, "
+                            + "delivery_owner VARCHAR(36), "
+                            + "delivery_claim_token VARCHAR(36), "
+                            + "delivery_claim_expires_at BIGINT NOT NULL DEFAULT 0)");
                 }
             } else {
                 throw e;
+            }
+        }
+        this.ensureColumn("delivery_owner VARCHAR(36)");
+        this.ensureColumn("delivery_claim_token VARCHAR(36)");
+        this.ensureColumn("delivery_claim_expires_at BIGINT NOT NULL DEFAULT 0");
+    }
+
+    private void ensureColumn(String definition) throws SQLException {
+        try (Connection connection = this.connectionSupplier.get();
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("ALTER TABLE uxm_network_link_codes ADD COLUMN " + definition);
+        } catch (SQLException error) {
+            String message = error.getMessage();
+            if (message == null || (!message.toLowerCase().contains("duplicate column")
+                    && !message.toLowerCase().contains("already exists"))) {
+                throw error;
             }
         }
     }
@@ -185,10 +215,13 @@ public final class NetworkLinkStore {
 
     public List<Delivery> pending(String server) throws SQLException {
         List<Delivery> deliveries = new ArrayList<>();
+        long now = System.currentTimeMillis();
         try (Connection connection = this.connectionSupplier.get();
              PreparedStatement select = connection.prepareStatement(
-                     "SELECT * FROM uxm_network_link_codes WHERE server = ? AND linked_at > 0 AND delivered = 0")) {
+                     "SELECT * FROM uxm_network_link_codes WHERE server = ? AND linked_at > 0 AND delivered = 0 "
+                             + "AND (delivery_owner IS NULL OR delivery_claim_expires_at < ?)")) {
             select.setString(1, server);
+            select.setLong(2, now);
             try (ResultSet row = select.executeQuery()) {
                 while (row.next()) {
                     deliveries.add(new Delivery(
@@ -209,12 +242,83 @@ public final class NetworkLinkStore {
         return deliveries;
     }
 
+    /**
+     * Claims a delivery for this worker. The claim is only ownership; complete it after
+     * the reward work has run on the Bukkit thread.
+     */
     public boolean claim(String code, String server) throws SQLException {
+        return this.claimWithToken(code, server) != null;
+    }
+
+    public String claimWithToken(String code, String server) throws SQLException {
+        long now = System.currentTimeMillis();
+        String claimToken = UUID.randomUUID().toString();
         try (Connection connection = this.connectionSupplier.get();
              PreparedStatement update = connection.prepareStatement(
-                     "UPDATE uxm_network_link_codes SET delivered = 1 WHERE code = ? AND server = ? AND linked_at > 0 AND delivered = 0")) {
+                     "UPDATE uxm_network_link_codes SET delivery_owner = ?, delivery_claim_token = ?, "
+                             + "delivery_claim_expires_at = ? WHERE code = ? AND server = ? AND linked_at > 0 "
+                             + "AND delivered = 0 AND (delivery_owner IS NULL OR delivery_claim_expires_at < ?)")) {
+            update.setString(1, this.claimOwner);
+            update.setString(2, claimToken);
+            update.setLong(3, now + this.claimLeaseMillis);
+            update.setString(4, code);
+            update.setString(5, server);
+            update.setLong(6, now);
+            return update.executeUpdate() == 1 ? claimToken : null;
+        }
+    }
+
+    public boolean complete(String code, String server) throws SQLException {
+        try (Connection connection = this.connectionSupplier.get();
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE uxm_network_link_codes SET delivered = 1, delivery_owner = NULL, "
+                             + "delivery_claim_token = NULL, delivery_claim_expires_at = 0 WHERE code = ? "
+                             + "AND server = ? AND linked_at > 0 AND delivered = 0 AND delivery_owner = ?")) {
             update.setString(1, code);
             update.setString(2, server);
+            update.setString(3, this.claimOwner);
+            return update.executeUpdate() == 1;
+        }
+    }
+
+    public boolean complete(String code, String server, String claimToken) throws SQLException {
+        try (Connection connection = this.connectionSupplier.get();
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE uxm_network_link_codes SET delivered = 1, delivery_owner = NULL, "
+                             + "delivery_claim_token = NULL, delivery_claim_expires_at = 0 WHERE code = ? "
+                             + "AND server = ? AND linked_at > 0 AND delivered = 0 AND delivery_owner = ? "
+                             + "AND delivery_claim_token = ?")) {
+            update.setString(1, code);
+            update.setString(2, server);
+            update.setString(3, this.claimOwner);
+            update.setString(4, claimToken);
+            return update.executeUpdate() == 1;
+        }
+    }
+
+    public boolean release(String code, String server) throws SQLException {
+        try (Connection connection = this.connectionSupplier.get();
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE uxm_network_link_codes SET delivery_owner = NULL, delivery_claim_token = NULL, "
+                             + "delivery_claim_expires_at = 0 WHERE code = ? AND server = ? AND delivered = 0 "
+                             + "AND delivery_owner = ?")) {
+            update.setString(1, code);
+            update.setString(2, server);
+            update.setString(3, this.claimOwner);
+            return update.executeUpdate() == 1;
+        }
+    }
+
+    public boolean release(String code, String server, String claimToken) throws SQLException {
+        try (Connection connection = this.connectionSupplier.get();
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE uxm_network_link_codes SET delivery_owner = NULL, delivery_claim_token = NULL, "
+                             + "delivery_claim_expires_at = 0 WHERE code = ? AND server = ? AND delivered = 0 "
+                             + "AND delivery_owner = ? AND delivery_claim_token = ?")) {
+            update.setString(1, code);
+            update.setString(2, server);
+            update.setString(3, this.claimOwner);
+            update.setString(4, claimToken);
             return update.executeUpdate() == 1;
         }
     }

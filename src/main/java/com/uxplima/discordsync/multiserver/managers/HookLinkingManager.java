@@ -70,10 +70,22 @@ public class HookLinkingManager extends LinkingManager {
                         continue;
                     }
 
-                    if (this.linkStore.claim(delivery.code(), this.serverName)) {
+                    String claimToken = this.linkStore.claimWithToken(delivery.code(), this.serverName);
+                    if (claimToken != null) {
                         this.logger.info("Claimed link delivery for online player: " + player.getName());
                         Bukkit.getScheduler().runTask(this.plugin, () -> {
-                            this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked());
+                            if (!player.isOnline()) {
+                                this.releaseDelivery(delivery.code(), claimToken);
+                                return;
+                            }
+                            try {
+                                this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked());
+                                this.acknowledgeDelivery(delivery.code(), claimToken);
+                            } catch (RuntimeException error) {
+                                this.logger.warning("Link reward delivery failed for " + player.getName()
+                                        + "; releasing claim: " + error.getMessage());
+                                this.releaseDelivery(delivery.code(), claimToken);
+                            }
                         });
                     }
                 }
@@ -81,6 +93,28 @@ public class HookLinkingManager extends LinkingManager {
                 this.logger.warning("Error during pending link delivery check: " + e.getMessage());
             }
         }, 20L, 20L); // every 1 second
+    }
+
+    private void acknowledgeDelivery(String code, String claimToken) {
+        Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
+            try {
+                if (!this.linkStore.complete(code, this.serverName, claimToken)) {
+                    this.logger.warning("Link delivery acknowledgement was rejected for code " + code);
+                }
+            } catch (SQLException e) {
+                this.logger.warning("Failed to acknowledge link delivery " + code + ": " + e.getMessage());
+            }
+        });
+    }
+
+    private void releaseDelivery(String code, String claimToken) {
+        Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
+            try {
+                this.linkStore.release(code, this.serverName, claimToken);
+            } catch (SQLException e) {
+                this.logger.warning("Failed to release link delivery " + code + ": " + e.getMessage());
+            }
+        });
     }
 
     private void startCleanupTask(Plugin hookPlugin) {
@@ -188,15 +222,6 @@ public class HookLinkingManager extends LinkingManager {
                 if (account != null) {
                     this.logger.info("Successfully redeemed link code " + code + " for " + account.getMinecraftUsername()
                             + " (Origin server: " + account.getServer() + ")");
-                    // If the player happens to be on this server right now, delivery loop or local task will execute rewards
-                    Player localPlayer = Bukkit.getPlayer(account.getMinecraftUUID());
-                    if (localPlayer != null && localPlayer.isOnline() && account.getServer().equalsIgnoreCase(this.serverName)) {
-                        if (this.linkStore.claim(code, this.serverName)) {
-                            Bukkit.getScheduler().runTask(this.plugin, () -> {
-                                this.deliverLinkRewards(localPlayer, account, false);
-                            });
-                        }
-                    }
                 }
                 return account;
             } catch (SQLException e) {

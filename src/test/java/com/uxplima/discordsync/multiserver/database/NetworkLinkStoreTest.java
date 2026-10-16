@@ -86,9 +86,29 @@ class NetworkLinkStoreTest {
 
         boolean claimed = this.store.claim(code, server);
         assertTrue(claimed);
-
         assertFalse(this.store.claim(code, server));
         assertTrue(this.store.pending(server).isEmpty());
+        assertTrue(this.store.complete(code, server));
+        assertFalse(this.store.complete(code, server));
+    }
+    @Test
+    void expiredDeliveryClaimCanBeReclaimedButOldOwnerCannotComplete() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        String code = "555666";
+        this.store.createCode(uuid, "ClaimedPlayer", "leaf-1", code, System.currentTimeMillis() + 60000L);
+        assertNotNull(this.store.redeem(code, "123", "ClaimedDiscord"));
+
+        NetworkLinkStore firstOwner = new NetworkLinkStore(
+                () -> DriverManager.getConnection(DB_URL), true, -1L);
+        NetworkLinkStore secondOwner = new NetworkLinkStore(
+                () -> DriverManager.getConnection(DB_URL), true, 30000L);
+        String firstToken = firstOwner.claimWithToken(code, "leaf-1");
+        assertNotNull(firstToken);
+        assertTrue(secondOwner.pending("leaf-1").stream().anyMatch(delivery -> code.equals(delivery.code())));
+        String secondToken = secondOwner.claimWithToken(code, "leaf-1");
+        assertNotNull(secondToken);
+        assertFalse(firstOwner.complete(code, "leaf-1", firstToken));
+        assertTrue(secondOwner.complete(code, "leaf-1", secondToken));
     }
 
     @Test

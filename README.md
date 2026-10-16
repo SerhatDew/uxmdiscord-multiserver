@@ -21,8 +21,8 @@ uxmDiscordSync için çoklu sunucu (multi-server / BungeeCord / Velocity) senkro
 - **Paylaşımlı Eşleme (Shared Linking):** Oyuncu hesabını herhangi bir alt sunucuda bir kez eşlediğinde, durum tüm ağ genelinde senkronize edilir.
 - **Esnek Ödül Modları:** `per-server` (her sunucuda ayrı ödül hakkı) veya `global` (tüm ağda tek seferlik ödül) desteği.
 - **Dağıtık Sunucu Kira (Lease) Mekanizması:** Kalp atışı (heartbeat) tabanlı veritabanı kira yönetimiyle aynı sunucu adının birden fazla açık kalmasını engeller, çevrimdışı sunucuları tespit eder.
-- **Çapraz Sunucu Komut Kuyruğu:** Discord üzerinden tetiklenen ödül ve rolleri hedef sunucuya ve oyuncuya SQL tabanlı komut kuyruğuyla iletir.
-- **PlaceholderAPI ve LuckPerms Desteği:** İsteğe bağlı olarak yetki ve yer tutucu entegrasyonu sağlar.
+- **Çapraz Sunucu Komut Kuyruğu:** Discord üzerinden tetiklenen ödül ve rolleri hedef sunucuya ve oyuncuya SQL tabanlı komut kuyruğuyla iletir; teslim edilmemiş kayıtlar yeniden denenebilir.
+- **PlaceholderAPI ve LuckPerms Desteği:** İsteğe bağlı olarak yetki ve yer tutucu entegrasyonu sağlar; bu API'ler JAR içine kopyalanmaz, sunucudaki eklentilerden alınır.
 
 ## Gereksinimler
 
@@ -52,7 +52,9 @@ uxmDiscordSync için çoklu sunucu (multi-server / BungeeCord / Velocity) senkro
 ```
 
 1. **Koordinatör Sunucu:** Botu aktif çalıştırır, Discord üzerindeki etkileşimleri ve eşleme butonlarını dinler.
-2. **Alt Sunucular:** `uxmDiscordSync`'in arka planda bot başlatmasını pasife alır, veritabanı üzerinden eşleşme durumunu ve komut kuyruğunu okur.
+2. **Alt Sunucular:** Ana eklentinin başlatabildiği Gateway bağlantısı hook tarafından durdurulur; alt sunucular yalnızca paylaşılan veritabanından eşleme durumu ve komutları okur.
+
+Komut ve ödül kayıtları işlenmeden önce kısa süreli SQL sahiplik kirası alır. Başarılı Bukkit işlemi sonrasında kayıt onaylanır; işlem yarıda kesilirse kira süresi dolduğunda başka bir sunucu yeniden deneyebilir. Bukkit komutları dış sistem olduğundan, işlem ile onay arasındaki çökme penceresinde yinelenen uygulama mümkündür; kuyruk tam olarak bir kez (exactly-once) semantiği vaat etmez.
 
 ## Kurulum
 

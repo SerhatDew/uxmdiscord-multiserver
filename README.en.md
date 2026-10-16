@@ -21,8 +21,8 @@ Multi-server (BungeeCord / Velocity network) synchronization extension hook for 
 - **Shared Account Linking:** Once a player links their Minecraft account with Discord on any server, the state is synchronized network-wide.
 - **Flexible Reward Modes:** Supports `per-server` (rewards claimable once on each server) or `global` (rewards claimable only once across the whole network).
 - **Distributed Server Leases:** Heartbeat-based database lease management prevents duplicate active instances with the same server name and detects stale nodes.
-- **Cross-Server Command Queue:** SQL-based command queue dispatches Discord-triggered reward commands to target players on target sub-servers.
-- **PlaceholderAPI & LuckPerms:** Optional soft-depend hooks for permissions and placeholders.
+- **Cross-Server Command Queue:** SQL-based command queue dispatches Discord-triggered reward commands to target players on target sub-servers; unclaimed records are retried.
+- **PlaceholderAPI & LuckPerms:** Optional soft-depend hooks for permissions and placeholders; their APIs are supplied by the server plugins and are not bundled into this JAR.
 
 ## Requirements
 
@@ -52,7 +52,9 @@ Multi-server (BungeeCord / Velocity network) synchronization extension hook for 
 ```
 
 1. **Coordinator Server:** Keeps the bot gateway alive and handles Discord interactions.
-2. **Sub-Servers:** Hook overrides unnecessary bot connections and reads link state and commands from the shared database.
+2. **Sub-Servers:** If the core plugin starts a Gateway connection, the hook stops it; sub-servers only read link state and commands from the shared database.
+
+Command and reward rows receive a short SQL ownership lease before processing. A successful Bukkit operation is acknowledged afterward; if a process stops mid-flight, another server can retry after the lease expires. Because Bukkit commands are external side effects, a crash between execution and acknowledgement can duplicate an operation; the queue does not promise exactly-once semantics.
 
 ## Installation
 

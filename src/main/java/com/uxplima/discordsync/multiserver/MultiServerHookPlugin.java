@@ -11,7 +11,6 @@ import com.uxplima.discordsync.multiserver.managers.HookLinkingManager;
 import com.uxplima.discordsync.multiserver.managers.HookTwoFactorManager;
 import com.uxplima.discordsync.multiserver.utils.ReflectionUtils;
 import net.dv8tion.jda.api.JDA;
-import net.dv8tion.jda.api.OnlineStatus;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -34,6 +33,7 @@ public final class MultiServerHookPlugin extends JavaPlugin {
     private BukkitTask commandQueueTask;
     private BukkitTask jdaHookWatcherTask;
     private final AtomicBoolean jdaHooked = new AtomicBoolean(false);
+    private final AtomicBoolean secondaryStopRequested = new AtomicBoolean(false);
 
     @Override
     public void onEnable() {
@@ -125,18 +125,22 @@ public final class MultiServerHookPlugin extends JavaPlugin {
             this.getLogger().severe("Failed to inject HookTwoFactorManager: " + e.getMessage());
         }
 
-        // 4. Start command queue listener for non-coordinator or target servers
+        // 4. Start command queue listener for target servers.
         this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
             try {
                 List<CommandQueueStore.QueuedCommand> list = this.commandQueueStore.pollPending(this.config.getServerName());
-                if (!list.isEmpty()) {
-                    for (CommandQueueStore.QueuedCommand item : list) {
-                        Bukkit.getScheduler().runTask(this, () -> {
+                for (CommandQueueStore.QueuedCommand item : list) {
+                    Bukkit.getScheduler().runTask(this, () -> {
+                        try {
                             this.getLogger().info("Executing queued command from Discord: " + item.command());
                             Bukkit.dispatchCommand(Bukkit.getConsoleSender(), item.command());
-                        });
-                        this.commandQueueStore.markExecuted(item.id());
-                    }
+                            this.acknowledgeCommand(item);
+                        } catch (RuntimeException error) {
+                            this.getLogger().warning("Queued command failed; releasing claim for retry: "
+                                    + error.getMessage());
+                            this.releaseCommand(item);
+                        }
+                    });
                 }
             } catch (SQLException e) {
                 this.getLogger().fine("Command queue poll exception: " + e.getMessage());
@@ -145,6 +149,28 @@ public final class MultiServerHookPlugin extends JavaPlugin {
 
         // 5. Watch for JDA startup and hook Discord
         this.startJdaHookWatcher(uxm);
+    }
+
+    private void acknowledgeCommand(CommandQueueStore.QueuedCommand command) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                if (!this.commandQueueStore.markExecuted(command)) {
+                    this.getLogger().warning("Queued command acknowledgement was rejected for id " + command.id());
+                }
+            } catch (SQLException e) {
+                this.getLogger().warning("Failed to acknowledge queued command " + command.id() + ": " + e.getMessage());
+            }
+        });
+    }
+
+    private void releaseCommand(CommandQueueStore.QueuedCommand command) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                this.commandQueueStore.release(command);
+            } catch (SQLException e) {
+                this.getLogger().warning("Failed to release queued command " + command.id() + ": " + e.getMessage());
+            }
+        });
     }
 
     private void startJdaHookWatcher(UXMDiscordSync uxm) {
@@ -156,6 +182,23 @@ public final class MultiServerHookPlugin extends JavaPlugin {
                 if (MultiServerHookPlugin.this.jdaHooked.get()) {
                     if (MultiServerHookPlugin.this.jdaHookWatcherTask != null) {
                         MultiServerHookPlugin.this.jdaHookWatcherTask.cancel();
+                    }
+                    return;
+                }
+
+                if (!MultiServerHookPlugin.this.config.isCoordinator()) {
+                    var discordBot = uxm.getDiscordBot();
+                    if (discordBot != null && discordBot.getJDA() != null
+                            && MultiServerHookPlugin.this.secondaryStopRequested.compareAndSet(false, true)) {
+                        Bukkit.getScheduler().runTaskAsynchronously(MultiServerHookPlugin.this, () -> {
+                            try {
+                                discordBot.shutdown();
+                                MultiServerHookPlugin.this.getLogger().info(
+                                        "Secondary server: stopped the inherited Discord Gateway connection.");
+                            } finally {
+                                MultiServerHookPlugin.this.secondaryStopRequested.set(false);
+                            }
+                        });
                     }
                     return;
                 }
@@ -186,11 +229,6 @@ public final class MultiServerHookPlugin extends JavaPlugin {
 
     private void hookJda(UXMDiscordSync uxm, JDA jda) {
         try {
-            // Secondary servers presence
-            if (!this.config.isCoordinator()) {
-                jda.getPresence().setStatus(OnlineStatus.INVISIBLE);
-                this.getLogger().info("Secondary server: set bot presence to INVISIBLE.");
-            }
 
             // Remove default listeners that would collide across servers
             List<Object> listeners = new ArrayList<>(jda.getRegisteredListeners());

@@ -44,14 +44,30 @@ class CommandQueueStoreTest {
         // Mark first executed
         assertTrue(this.store.markExecuted(leaf2Cmds.get(0).id()));
 
-        // Poll again for leaf-2
+        // Claimed rows stay hidden until the original poll acknowledges them.
         List<CommandQueueStore.QueuedCommand> remaining = this.store.pollPending("leaf-2");
-        assertEquals(1, remaining.size());
-        assertEquals("kick BadPlayer", remaining.get(0).command());
+        assertTrue(remaining.isEmpty());
+        assertTrue(this.store.markExecuted(leaf2Cmds.get(1).id()));
 
         // Poll for leaf-1
         List<CommandQueueStore.QueuedCommand> leaf1Cmds = this.store.pollPending("leaf-1");
         assertEquals(1, leaf1Cmds.size());
         assertEquals("say Hello Leaf 1", leaf1Cmds.get(0).command());
+    }
+
+    @Test
+    void expiredClaimCanBeReclaimedAndOldOwnerCannotAcknowledge() throws Exception {
+        CommandQueueStore firstOwner = new CommandQueueStore(
+                () -> DriverManager.getConnection(DB_URL), -1L);
+        CommandQueueStore secondOwner = new CommandQueueStore(
+                () -> DriverManager.getConnection(DB_URL), 30000L);
+        assertTrue(firstOwner.queue("leaf-1", "say once"));
+
+        List<CommandQueueStore.QueuedCommand> first = firstOwner.pollPending("leaf-1");
+        assertEquals(1, first.size());
+        List<CommandQueueStore.QueuedCommand> second = secondOwner.pollPending("leaf-1");
+        assertEquals(1, second.size());
+        assertFalse(firstOwner.markExecuted(first.get(0)));
+        assertTrue(secondOwner.markExecuted(second.get(0)));
     }
 }
