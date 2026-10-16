@@ -104,7 +104,11 @@ public class HookLinkingManager extends LinkingManager {
                             return;
                         }
                         try {
-                            this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked());
+                            if (!this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked())) {
+                                this.releaseDelivery(delivery.code(), claimToken,
+                                        () -> this.finishDeliveryBatch(remaining));
+                                return;
+                            }
                             this.acknowledgeDelivery(delivery.code(), claimToken,
                                     () -> this.finishDeliveryBatch(remaining));
                         } catch (RuntimeException error) {
@@ -165,9 +169,9 @@ public class HookLinkingManager extends LinkingManager {
         }, 6000L, 6000L); // every 5 minutes
     }
 
-    private void deliverLinkRewards(Player player, LinkedAccount account, boolean wasLinkedBefore) {
+    private boolean deliverLinkRewards(Player player, LinkedAccount account, boolean wasLinkedBefore) {
         if (!player.isOnline()) {
-            return;
+            return false;
         }
 
         // Cache the account locally
@@ -211,6 +215,7 @@ public class HookLinkingManager extends LinkingManager {
         if (this.plugin.getConfigManager().isNicknameSyncOnLink() && this.plugin.getNicknameManager() != null) {
             this.plugin.getNicknameManager().syncNickname(player);
         }
+        return true;
     }
 
     @Override
