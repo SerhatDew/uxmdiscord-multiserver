@@ -1,0 +1,25 @@
+# ================================================================================================
+# uxmDiscordSync-MultiServer Hook Configuration
+# ================================================================================================
+
+multi-server:
+  # Enable multi-server support
+  enabled: true
+
+  # Server name identifier
+  # Set to "auto" to automatically use plugin.server-name from uxmDiscordSync's config.yml
+  server-name: "auto"
+
+  # Coordinator server name
+  # Only this server will connect to Discord visibly, handle slash commands and link embed panels.
+  discord-coordinator-server: "main"
+
+  # Link mode: "shared" or "separate"
+  # - shared: Account linked once across all servers, rewards delivered to the player's server
+  # - separate: Each server requires separate linking
+  link-mode: "shared"
+
+  # Reward mode: "per-server" or "global"
+  # - per-server: Rewards can be claimed once on each server
+  # - global: Rewards can only be claimed once across the whole network
+  reward-mode: "per-server"

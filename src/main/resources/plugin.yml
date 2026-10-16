@@ -1,0 +1,11 @@
+name: uxmDiscordSync-MultiServer
+version: '1.0.0'
+main: com.uxplima.discordsync.multiserver.MultiServerHookPlugin
+api-version: '1.21'
+author: serhatdew
+description: Multi-server synchronization extension for uxmDiscordSync
+depend:
+  - uxmDiscordSync
+softdepend:
+  - LuckPerms
+  - PlaceholderAPI
