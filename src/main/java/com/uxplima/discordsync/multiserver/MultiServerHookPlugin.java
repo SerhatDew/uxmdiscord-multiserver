@@ -128,48 +128,52 @@ public final class MultiServerHookPlugin extends JavaPlugin {
         }
 
         // 4. Start command queue listener for target servers.
-        this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
-            if (!this.commandBatchInFlight.compareAndSet(false, true)) {
-                return;
-            }
-            try {
-                List<CommandQueueStore.QueuedCommand> list = this.commandQueueStore.pollPending(this.config.getServerName());
-                if (list.isEmpty()) {
-                    this.commandBatchInFlight.set(false);
-                    return;
-                }
-
-                AtomicInteger remaining = new AtomicInteger(1);
-                for (CommandQueueStore.QueuedCommand item : list) {
-                    remaining.incrementAndGet();
-                    try {
-                        Bukkit.getScheduler().runTask(this, () -> {
-                            try {
-                                this.getLogger().info("Executing queued command from Discord: " + item.command());
-                                if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), item.command())) {
-                                    throw new IllegalStateException("Bukkit rejected the command");
-                                }
-                                this.acknowledgeCommand(item, () -> this.finishCommandBatch(remaining));
-                            } catch (RuntimeException error) {
-                                this.getLogger().warning("Queued command failed; releasing claim for retry: "
-                                        + error.getMessage());
-                                this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
-                            }
-                        });
-                    } catch (RuntimeException error) {
-                        this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
-                    }
-                }
-                this.finishCommandBatch(remaining);
-            } catch (SQLException e) {
-                this.commandBatchInFlight.set(false);
-                this.getLogger().fine("Command queue poll exception: " + e.getMessage());
-            }
-        }, 20L, 20L); // every 1 second
+        this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
+                this, this::pollCommandQueue, 20L, 20L); // every 1 second
 
         // 5. Watch for JDA startup and hook Discord
         this.startJdaHookWatcher(uxm);
     }
+
+    private void pollCommandQueue() {
+        if (!this.commandBatchInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            List<CommandQueueStore.QueuedCommand> list = this.commandQueueStore.pollPending(this.config.getServerName());
+            if (list.isEmpty()) {
+                this.commandBatchInFlight.set(false);
+                return;
+            }
+
+            AtomicInteger remaining = new AtomicInteger(1);
+            for (CommandQueueStore.QueuedCommand item : list) {
+                remaining.incrementAndGet();
+                try {
+                    Bukkit.getScheduler().runTask(this, () -> {
+                        try {
+                            this.getLogger().info("Executing queued command from Discord: " + item.command());
+                            if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), item.command())) {
+                                throw new IllegalStateException("Bukkit rejected the command");
+                            }
+                            this.acknowledgeCommand(item, () -> this.finishCommandBatch(remaining));
+                        } catch (RuntimeException error) {
+                            this.getLogger().warning("Queued command failed; releasing claim for retry: "
+                                    + error.getMessage());
+                            this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
+                        }
+                    });
+                } catch (RuntimeException error) {
+                    this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
+                }
+            }
+            this.finishCommandBatch(remaining);
+        } catch (SQLException e) {
+            this.commandBatchInFlight.set(false);
+            this.getLogger().fine("Command queue poll exception: " + e.getMessage());
+        }
+    }
+
 
     private void finishCommandBatch(AtomicInteger remaining) {
         if (remaining.decrementAndGet() == 0) {
