@@ -11,7 +11,7 @@ Multi-server (BungeeCord / Velocity network) synchronization extension hook for 
 
 [**Download latest JAR**](https://github.com/SerhatDew/uxmdiscord-multiserver/releases/latest/download/uxmdiscordsync-multiserver.jar) · [Release notes](https://github.com/SerhatDew/uxmdiscord-multiserver/releases/latest)
 
-[Features](#features) · [Requirements](#requirements) · [Architecture](#architecture) · [Installation](#installation) · [Configuration](#configuration) · [Building](#building) · [License](#license)
+- [Features](#features) · [Requirements](#requirements) · [Architecture](#architecture) · [Lifecycle](#lifecycle-and-readiness) · [Installation](#installation) · [Configuration](#configuration) · [Building](#building) · [License](#license)
 
 ---
 
@@ -55,6 +55,10 @@ Multi-server (BungeeCord / Velocity network) synchronization extension hook for 
 2. **Sub-Servers:** If the core plugin starts a Gateway connection, the hook stops it; sub-servers only read link state and commands from the shared database.
 
 Command and reward rows receive a short SQL ownership lease before processing. A successful Bukkit operation is acknowledged afterward; if a process stops mid-flight, another server can retry after the lease expires. Because Bukkit commands are external side effects, a crash between execution and acknowledgement can duplicate an operation; the queue does not promise exactly-once semantics.
+
+### Lifecycle and readiness
+
+At startup the hook validates its configuration and installs its local SQL, manager, and queue tasks. When multi-server mode is disabled, it remains passive. A coordinator becomes ready only after a usable Discord Gateway is available and its listener is attached successfully; waiting, timeout, or listener failure never reports success. A sub-server may become ready once its local queue and managers are installed, without owning the Gateway connection. Shutdown attempts every lease, queue, watcher, and manager cleanup step; one failure does not prevent the remaining cleanup.
 
 ## Installation
 

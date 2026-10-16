@@ -11,7 +11,7 @@ uxmDiscordSync için çoklu sunucu (multi-server / BungeeCord / Velocity) senkro
 
 [**En yeni JAR'ı indir**](https://github.com/SerhatDew/uxmdiscord-multiserver/releases/latest/download/uxmdiscordsync-multiserver.jar) · [Sürüm notları](https://github.com/SerhatDew/uxmdiscord-multiserver/releases/latest)
 
-[Özellikler](#özellikler) · [Gereksinimler](#gereksinimler) · [Mimari](#mimari) · [Kurulum](#kurulum) · [Yapılandırma](#yapılandırma) · [Derleme](#derleme) · [Lisans](#lisans)
+- [Özellikler](#özellikler) · [Gereksinimler](#gereksinimler) · [Mimari](#mimari) · [Yaşam döngüsü](#yaşam-döngüsü-ve-hazır-olma) · [Kurulum](#kurulum) · [Yapılandırma](#yapılandırma) · [Derleme](#derleme) · [Lisans](#lisans)
 
 ---
 
@@ -55,6 +55,10 @@ uxmDiscordSync için çoklu sunucu (multi-server / BungeeCord / Velocity) senkro
 2. **Alt Sunucular:** Ana eklentinin başlatabildiği Gateway bağlantısı hook tarafından durdurulur; alt sunucular yalnızca paylaşılan veritabanından eşleme durumu ve komutları okur.
 
 Komut ve ödül kayıtları işlenmeden önce kısa süreli SQL sahiplik kirası alır. Başarılı Bukkit işlemi sonrasında kayıt onaylanır; işlem yarıda kesilirse kira süresi dolduğunda başka bir sunucu yeniden deneyebilir. Bukkit komutları dış sistem olduğundan, işlem ile onay arasındaki çökme penceresinde yinelenen uygulama mümkündür; kuyruk tam olarak bir kez (exactly-once) semantiği vaat etmez.
+
+### Yaşam döngüsü ve hazır olma
+
+Eklenti açılışta yapılandırmayı ve yerel SQL/yönetici görevlerini doğrular. Çoklu sunucu modu kapalıysa eklenti pasif kalır. Koordinatör yalnızca Discord Gateway kullanılabilir duruma gelip kendi dinleyicisi başarıyla bağlandıktan sonra hazır kabul edilir; Gateway bekleme, zaman aşımı veya dinleyici hatasında başarı mesajı verilmez. İkincil sunucu ise yerel kuyruk ve yöneticiler hazır olduğunda, Gateway bağlantısını devralmadan çalışmaya hazır olur. Kapanışta kira, kuyruk ve bekleme görevleri ile yöneticilerin tamamı denenir; bir hata diğer temizlik adımlarını engellemez.
 
 ## Kurulum
 

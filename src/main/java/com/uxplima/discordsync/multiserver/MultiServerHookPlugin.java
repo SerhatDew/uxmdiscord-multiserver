@@ -1,5 +1,6 @@
 package com.uxplima.discordsync.multiserver;
 
+import com.blokoyun.hooks.common.logging.LifecycleLogger;
 import com.uxplima.discordsync.UXMDiscordSync;
 import com.uxplima.discordsync.multiserver.config.MultiServerConfig;
 import com.uxplima.discordsync.multiserver.database.CommandQueueStore;
@@ -18,10 +19,12 @@ import org.bukkit.scheduler.BukkitTask;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class MultiServerHookPlugin extends JavaPlugin {
+    private LifecycleLogger lifecycle;
     private MultiServerConfig config;
     private DatabaseAccess databaseAccess;
     private NetworkLinkStore networkLinkStore;
@@ -36,103 +39,96 @@ public final class MultiServerHookPlugin extends JavaPlugin {
     private final AtomicBoolean jdaHooked = new AtomicBoolean(false);
     private final AtomicBoolean secondaryStopRequested = new AtomicBoolean(false);
     private final AtomicBoolean commandBatchInFlight = new AtomicBoolean(false);
+    private AtomicBoolean resourcesCleaned = new AtomicBoolean(false);
+    private long startupNanos;
+    private volatile boolean startupInvoked;
+    private volatile boolean startupFailureHandled;
+    private volatile boolean shutdownInvoked;
+    private volatile boolean passiveMode;
+    private volatile boolean readyReported;
 
     @Override
     public void onEnable() {
-        this.saveDefaultConfig();
-
-        UXMDiscordSync uxm = UXMDiscordSync.getInstance();
-        if (uxm == null || !uxm.isEnabled()) {
-            this.getLogger().severe("uxmDiscordSync is not loaded or enabled! Disabling uxmDiscordSync-MultiServer.");
-            this.getServer().getPluginManager().disablePlugin(this);
-            return;
-        }
-
-        this.config = new MultiServerConfig(this.getConfig(), uxm);
-
-        this.getLogger().info("==================================================");
-        this.getLogger().info(" uxmDiscordSync-MultiServer Hook Plugin");
-        this.getLogger().info(" Server Name: " + this.config.getServerName());
-        this.getLogger().info(" Coordinator: " + this.config.getCoordinatorServer() + " (Is Coordinator: " + this.config.isCoordinator() + ")");
-        this.getLogger().info(" Link Mode: " + this.config.getLinkMode() + ", Reward Mode: " + this.config.getRewardMode());
-        this.getLogger().info("==================================================");
-
-        if (!this.config.isEnabled()) {
-            this.getLogger().warning("Multi-server mode is disabled in config. Hook will stay idle.");
-            return;
-        }
-
-        // 1. Initialize database access
+        this.startupNanos = System.nanoTime();
+        this.startupInvoked = true;
         try {
+            this.lifecycle().startup();
+            this.saveDefaultConfig();
+
+            UXMDiscordSync uxm = UXMDiscordSync.getInstance();
+            if (uxm == null || !uxm.isEnabled()) {
+                throw new IllegalStateException("uxmDiscordSync yüklü veya etkin değil.");
+            }
+
+            this.config = new MultiServerConfig(this.getConfig(), uxm);
+            this.lifecycle().info("Yapılandırma yüklendi.");
+            this.lifecycle().info("Sunucu: " + this.config.getServerName() + "; rol: "
+                    + (!this.config.isEnabled() ? "pasif"
+                    : (this.config.isCoordinator() ? "koordinatör" : "ikincil")) + ".");
+
+            if (!this.config.isEnabled()) {
+                this.passiveMode = true;
+                this.lifecycle().inactive("Çoklu sunucu modu yapılandırmada kapalı; sunucu: "
+                        + this.config.getServerName() + ".");
+                return;
+            }
+
             this.databaseAccess = new DatabaseAccess(uxm, this.getLogger());
-            this.networkLinkStore = new NetworkLinkStore(this.databaseAccess::getConnection, this.config.isGlobalRewards());
+            this.networkLinkStore = new NetworkLinkStore(
+                    this.databaseAccess::getConnection, this.config.isGlobalRewards());
             this.networkLinkStore.createTables();
 
             this.commandQueueStore = new CommandQueueStore(this.databaseAccess::getConnection);
             this.commandQueueStore.createTables();
 
-            this.serverLease = new ServerLease(this.databaseAccess::getConnection, this.config.getServerName(), 30000L);
-            long now = System.currentTimeMillis();
-            if (!this.serverLease.acquire(now)) {
-                this.getLogger().severe("==================================================");
-                this.getLogger().severe(" CRITICAL: server-name '" + this.config.getServerName() + "' is already in use by another active instance!");
-                this.getLogger().severe(" Each server must have a unique server-name.");
-                this.getLogger().severe(" Disabling uxmDiscordSync-MultiServer.");
-                this.getLogger().severe("==================================================");
-                this.getServer().getPluginManager().disablePlugin(this);
-                return;
+            this.serverLease = new ServerLease(
+                    this.databaseAccess::getConnection, this.config.getServerName(), 30000L);
+            if (!this.serverLease.acquire(System.currentTimeMillis())) {
+                throw new IllegalStateException("Sunucu kirası zaten kullanımda: "
+                        + this.config.getServerName());
             }
 
-            // Schedule lease renewal
             this.leaseTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
                 try {
                     this.serverLease.renew(System.currentTimeMillis());
                 } catch (SQLException e) {
-                    this.getLogger().warning("Failed to renew server lease: " + e.getMessage());
+                    this.getLogger().warning("Sunucu kirası yenilenemedi: " + e.getMessage());
                 }
-            }, 200L, 200L); // every 10s
-        } catch (Exception e) {
-            this.getLogger().severe("Failed to initialize multi-server database tables: " + e.getMessage());
-            this.getServer().getPluginManager().disablePlugin(this);
-            return;
-        }
+            }, 200L, 200L);
 
-        // 2. Inject HookLinkingManager
-        try {
             this.hookLinkingManager = new HookLinkingManager(
                     uxm,
                     this.networkLinkStore,
                     this.config.getServerName(),
-                    this.config.isEnabled(),
+                    true,
                     this.config.isSharedMode(),
-                    this
-            );
+                    this);
             ReflectionUtils.setField(uxm, "linkingManager", this.hookLinkingManager);
-            this.getLogger().info("Injected HookLinkingManager into uxmDiscordSync.");
-        } catch (Exception e) {
-            this.getLogger().severe("Failed to inject HookLinkingManager: " + e.getMessage());
-        }
 
-        // 3. Inject HookTwoFactorManager
-        try {
             this.hookTwoFactorManager = new HookTwoFactorManager(
                     uxm,
                     this.config.getServerName(),
-                    this.config.isEnabled(),
-                    this
-            );
+                    true,
+                    this);
             ReflectionUtils.setField(uxm, "twoFactorManager", this.hookTwoFactorManager);
-            this.getLogger().info("Injected HookTwoFactorManager into uxmDiscordSync.");
-        } catch (Exception e) {
-            this.getLogger().severe("Failed to inject HookTwoFactorManager: " + e.getMessage());
+
+            this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
+                    this, this::pollCommandQueue, 20L, 20L);
+
+            this.startJdaHookWatcher(uxm);
+            if (!this.config.isCoordinator() && !this.startupFailureHandled && !this.readyReported) {
+                this.readyReported = true;
+                this.lifecycle().info("Yerel kuyruk ve yöneticiler hazır; rol: ikincil; sunucu: "
+                        + this.config.getServerName() + ".");
+                this.lifecycle().started(this.startupNanos);
+            } else if (this.config.isCoordinator() && !this.readyReported
+                    && !this.startupFailureHandled) {
+                this.lifecycle().waiting("Discord Gateway ve dinleyici; rol: koordinatör; sunucu: "
+                        + this.config.getServerName() + ".");
+            }
+        } catch (Throwable failure) {
+            this.failStartup(failure);
         }
-
-        // 4. Start command queue listener for target servers.
-        this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
-                this, this::pollCommandQueue, 20L, 20L); // every 1 second
-
-        // 5. Watch for JDA startup and hook Discord
-        this.startJdaHookWatcher(uxm);
     }
 
     private void pollCommandQueue() {
@@ -208,122 +204,246 @@ public final class MultiServerHookPlugin extends JavaPlugin {
     }
 
     private void startJdaHookWatcher(UXMDiscordSync uxm) {
-        this.jdaHookWatcherTask = Bukkit.getScheduler().runTaskTimer(this, new Runnable() {
-            private int attempts = 0;
+        BukkitTask scheduledTask = Bukkit.getScheduler().runTaskTimer(this, new Runnable() {
+            private int attempts;
 
             @Override
             public void run() {
+                if (MultiServerHookPlugin.this.shutdownInvoked
+                        || MultiServerHookPlugin.this.startupFailureHandled) {
+                    cancelJdaWatcher();
+                    return;
+                }
                 if (MultiServerHookPlugin.this.jdaHooked.get()) {
-                    if (MultiServerHookPlugin.this.jdaHookWatcherTask != null) {
-                        MultiServerHookPlugin.this.jdaHookWatcherTask.cancel();
-                    }
+                    cancelJdaWatcher();
                     return;
                 }
 
                 if (!MultiServerHookPlugin.this.config.isCoordinator()) {
-                    var discordBot = uxm.getDiscordBot();
-                    var jda = discordBot == null ? null : discordBot.getJDA();
-                    if (jda != null && jda.getStatus() != JDA.Status.SHUTDOWN
-                            && jda.getStatus() != JDA.Status.SHUTTING_DOWN
-                            && MultiServerHookPlugin.this.secondaryStopRequested.compareAndSet(false, true)) {
-                        Bukkit.getScheduler().runTaskAsynchronously(MultiServerHookPlugin.this, () -> {
-                            try {
-                                discordBot.shutdown();
-                                MultiServerHookPlugin.this.getLogger().info(
-                                        "Secondary server: stopped the inherited Discord Gateway connection.");
-                            } finally {
-                                MultiServerHookPlugin.this.secondaryStopRequested.set(false);
-                            }
-                        });
+                    try {
+                        var discordBot = uxm.getDiscordBot();
+                        var jda = discordBot == null ? null : discordBot.getJDA();
+                        if (jda != null && jda.getStatus() != JDA.Status.SHUTDOWN
+                                && jda.getStatus() != JDA.Status.SHUTTING_DOWN
+                                && MultiServerHookPlugin.this.secondaryStopRequested.compareAndSet(false, true)) {
+                            Bukkit.getScheduler().runTaskAsynchronously(
+                                    MultiServerHookPlugin.this, () -> {
+                                        try {
+                                            discordBot.shutdown();
+                                            MultiServerHookPlugin.this.lifecycle().info(
+                                                    "İkincil sunucunun devralınan Discord Gateway bağlantısı kapatıldı; sunucu: "
+                                                            + MultiServerHookPlugin.this.config.getServerName() + ".");
+                                        } catch (Throwable failure) {
+                                            MultiServerHookPlugin.this.lifecycle().failure(
+                                                    "Devralınan Discord Gateway bağlantısı kapatılamadı; sunucu: "
+                                                            + MultiServerHookPlugin.this.config.getServerName() + ".",
+                                                    failure);
+                                        } finally {
+                                            MultiServerHookPlugin.this.secondaryStopRequested.set(false);
+                                        }
+                                    });
+                        }
+                    } catch (Throwable failure) {
+                        MultiServerHookPlugin.this.failStartup(failure);
                     }
                     return;
                 }
 
-                if (++this.attempts > 60) { // 30 seconds
-                    MultiServerHookPlugin.this.getLogger().warning("Timed out waiting for JDA initialization.");
-                    if (MultiServerHookPlugin.this.jdaHookWatcherTask != null) {
-                        MultiServerHookPlugin.this.jdaHookWatcherTask.cancel();
-                    }
+                if (++this.attempts > 60) {
+                    MultiServerHookPlugin.this.failStartup(new TimeoutException(
+                            "Discord Gateway 30 saniye içinde hazır olmadı."));
+                    cancelJdaWatcher();
                     return;
                 }
 
-                if (uxm.getDiscordBot() == null || uxm.getDiscordBot().getJDA() == null) {
-                    return;
-                }
-
-                JDA jda = uxm.getDiscordBot().getJDA();
-                if (jda.getStatus() == JDA.Status.CONNECTED || jda.getStatus() == JDA.Status.INITIALIZED) {
-                    MultiServerHookPlugin.this.hookJda(uxm, jda);
-                    MultiServerHookPlugin.this.jdaHooked.set(true);
-                    if (MultiServerHookPlugin.this.jdaHookWatcherTask != null) {
-                        MultiServerHookPlugin.this.jdaHookWatcherTask.cancel();
+                try {
+                    if (uxm.getDiscordBot() == null || uxm.getDiscordBot().getJDA() == null) {
+                        return;
                     }
+
+                    JDA jda = uxm.getDiscordBot().getJDA();
+                    JDA.Status status = jda.getStatus();
+                    if (status == JDA.Status.CONNECTED || status == JDA.Status.INITIALIZED) {
+                        MultiServerHookPlugin.this.hookJda(uxm, jda);
+                        MultiServerHookPlugin.this.jdaHooked.set(true);
+                        if (!MultiServerHookPlugin.this.readyReported) {
+                            MultiServerHookPlugin.this.readyReported = true;
+                            MultiServerHookPlugin.this.lifecycle().info(
+                                    "Discord dinleyicisi hazır; rol: koordinatör; sunucu: "
+                                            + MultiServerHookPlugin.this.config.getServerName() + ".");
+                            MultiServerHookPlugin.this.lifecycle().started(
+                                    MultiServerHookPlugin.this.startupNanos);
+                        }
+                        cancelJdaWatcher();
+                    }
+                } catch (Throwable failure) {
+                    MultiServerHookPlugin.this.failStartup(failure);
+                    cancelJdaWatcher();
+                }
+            }
+
+            private void cancelJdaWatcher() {
+                BukkitTask task = MultiServerHookPlugin.this.jdaHookWatcherTask;
+                if (task != null) {
+                    task.cancel();
                 }
             }
         }, 10L, 10L);
+
+        if (this.startupFailureHandled || this.jdaHooked.get()) {
+            scheduledTask.cancel();
+        } else {
+            this.jdaHookWatcherTask = scheduledTask;
+        }
     }
 
     private void hookJda(UXMDiscordSync uxm, JDA jda) {
-        try {
-
-            // Remove default listeners that would collide across servers
-            List<Object> listeners = new ArrayList<>(jda.getRegisteredListeners());
-            for (Object listener : listeners) {
-                String className = listener.getClass().getName();
-                if (className.contains("DiscordListeners")) {
-                    jda.removeEventListener(listener);
-                    this.getLogger().info("Removed original DiscordListeners from JDA.");
-                }
-                if (!this.config.isCoordinator()) {
-                    if (className.contains("CustomCommandManager") || className.contains("NewCommandManager")) {
-                        jda.removeEventListener(listener);
-                        this.getLogger().info("Secondary server: removed " + listener.getClass().getSimpleName() + ".");
-                    }
-                }
+        List<Object> listeners = new ArrayList<>(jda.getRegisteredListeners());
+        for (Object listener : listeners) {
+            String className = listener.getClass().getName();
+            if (className.contains("DiscordListeners")) {
+                jda.removeEventListener(listener);
+                this.lifecycle().info("Eski Discord dinleyicisi kaldırıldı; sunucu: "
+                        + this.config.getServerName() + ".");
             }
+            if (!this.config.isCoordinator()
+                    && (className.contains("CustomCommandManager")
+                    || className.contains("NewCommandManager"))) {
+                jda.removeEventListener(listener);
+                this.lifecycle().info("İkincil sunucunun eski komut dinleyicisi kaldırıldı; sunucu: "
+                        + this.config.getServerName() + ".");
+            }
+        }
 
-            // Add our HookDiscordListener
-            HookDiscordListener hookListener = new HookDiscordListener(
-                    uxm,
-                    this.config.getServerName(),
-                    this.config.isCoordinator(),
-                    this.config.isEnabled(),
-                    this.commandQueueStore,
-                    this.hookTwoFactorManager,
-                    this
-            );
-            jda.addEventListener(hookListener);
-            this.getLogger().info("Registered HookDiscordListener to JDA (Coordinator: " + this.config.isCoordinator() + ")");
-        } catch (Exception e) {
-            this.getLogger().severe("Failed to hook JDA: " + e.getMessage());
+        HookDiscordListener hookListener = new HookDiscordListener(
+                uxm,
+                this.config.getServerName(),
+                this.config.isCoordinator(),
+                this.config.isEnabled(),
+                this.commandQueueStore,
+                this.hookTwoFactorManager,
+                this);
+        jda.addEventListener(hookListener);
+    }
+    @Override
+    public void onDisable() {
+        if (!this.startupInvoked || this.shutdownInvoked) {
+            return;
+        }
+        this.shutdownInvoked = true;
+
+        Throwable failure = null;
+        try {
+            this.lifecycle().shutdown();
+        } catch (Throwable shutdownBannerFailure) {
+            failure = shutdownBannerFailure;
+        }
+
+        failure = this.cleanupOwnedResources(failure);
+        if (failure != null) {
+            if (!this.startupFailureHandled) {
+                this.lifecycle().shutdownFailed();
+            }
+            return;
+        }
+
+        if (this.passiveMode || this.readyReported) {
+            this.lifecycle().stopped(this.startupNanos);
+        } else {
+            this.lifecycle().stoppedBeforeReady();
         }
     }
 
-    @Override
-    public void onDisable() {
-        if (this.leaseTask != null) {
-            this.leaseTask.cancel();
+    private LifecycleLogger lifecycle() {
+        if (this.lifecycle == null) {
+            this.lifecycle = new LifecycleLogger(this);
         }
-        if (this.commandQueueTask != null) {
-            this.commandQueueTask.cancel();
+        return this.lifecycle;
+    }
+
+    private void failStartup(Throwable failure) {
+        if (this.startupFailureHandled) {
+            return;
         }
-        if (this.jdaHookWatcherTask != null) {
-            this.jdaHookWatcherTask.cancel();
+        this.startupFailureHandled = true;
+        this.lifecycle().startupFailed(failure);
+        Throwable cleanupFailure = this.cleanupOwnedResources(failure);
+        if (cleanupFailure != failure) {
+            this.lifecycle().failure("Başlatma temizliği başarısız oldu; sunucu: "
+                    + this.serverNameForLog() + ".", cleanupFailure);
+        }
+        try {
+            this.getServer().getPluginManager().disablePlugin(this);
+        } catch (Throwable disableFailure) {
+            failure.addSuppressed(disableFailure);
+            this.lifecycle().failure("Eklenti devre dışı bırakılamadı; sunucu: "
+                    + this.serverNameForLog() + ".", disableFailure);
+        }
+    }
+
+    private Throwable cleanupOwnedResources(Throwable primary) {
+        if (this.resourcesCleaned == null) {
+            this.resourcesCleaned = new AtomicBoolean(false);
+        }
+        if (!this.resourcesCleaned.compareAndSet(false, true)) {
+            return primary;
         }
 
-        if (this.hookLinkingManager != null) {
-            this.hookLinkingManager.shutdown();
+        Throwable failure = primary;
+        BukkitTask task = this.leaseTask;
+        this.leaseTask = null;
+        if (task != null) {
+            failure = attemptCleanup(failure, "sunucu kirası yenileme görevi", task::cancel);
         }
 
-        if (this.serverLease != null) {
-            try {
-                this.serverLease.close();
-                this.getLogger().info("Released server lease for " + this.config.getServerName());
-            } catch (SQLException e) {
-                this.getLogger().warning("Failed to release server lease on shutdown: " + e.getMessage());
+        task = this.commandQueueTask;
+        this.commandQueueTask = null;
+        if (task != null) {
+            failure = attemptCleanup(failure, "komut kuyruğu görevi", task::cancel);
+        }
+
+        task = this.jdaHookWatcherTask;
+        this.jdaHookWatcherTask = null;
+        if (task != null) {
+            failure = attemptCleanup(failure, "Discord bekleme görevi", task::cancel);
+        }
+
+        HookLinkingManager linkingManager = this.hookLinkingManager;
+        this.hookLinkingManager = null;
+        if (linkingManager != null) {
+            failure = attemptCleanup(failure, "eşleme yöneticisi", linkingManager::shutdown);
+        }
+
+        ServerLease lease = this.serverLease;
+        this.serverLease = null;
+        if (lease != null) {
+            failure = attemptCleanup(failure, "sunucu kirası", lease::close);
+        }
+        return failure;
+    }
+
+    @FunctionalInterface
+    private interface CleanupAction {
+        void run() throws Throwable;
+    }
+
+    private Throwable attemptCleanup(Throwable primary, String resource, CleanupAction cleanup) {
+        try {
+            cleanup.run();
+        } catch (Throwable cleanupFailure) {
+            this.lifecycle().failure("Kapanış kaynağı temizlenemedi (" + resource + "); sunucu: "
+                    + this.serverNameForLog() + ".", cleanupFailure);
+            if (primary == null) {
+                return cleanupFailure;
+            }
+            if (primary != cleanupFailure) {
+                primary.addSuppressed(cleanupFailure);
             }
         }
+        return primary;
+    }
 
-        this.getLogger().info("uxmDiscordSync-MultiServer disabled.");
+    private String serverNameForLog() {
+        return this.config == null ? "bilinmiyor" : this.config.getServerName();
     }
 }
