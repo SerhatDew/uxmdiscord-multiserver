@@ -77,18 +77,20 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- LuckPerms API (optional / softdepend) -->
+        <!-- LuckPerms API (optional / softdepend, supplied by LuckPerms) -->
         <dependency>
             <groupId>net.luckperms</groupId>
             <artifactId>api</artifactId>
             <version>5.4</version>
+            <scope>provided</scope>
         </dependency>
 
-        <!-- PlaceholderAPI (optional / softdepend) -->
+        <!-- PlaceholderAPI (optional / softdepend, supplied by PlaceholderAPI) -->
         <dependency>
             <groupId>me.clip</groupId>
             <artifactId>placeholderapi</artifactId>
             <version>2.11.6</version>
+            <scope>provided</scope>
         </dependency>
         <!-- Adventure API (provided by Paper) -->
         <dependency>
