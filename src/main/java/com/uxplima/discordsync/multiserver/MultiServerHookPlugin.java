@@ -19,6 +19,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class MultiServerHookPlugin extends JavaPlugin {
     private MultiServerConfig config;
@@ -34,6 +35,7 @@ public final class MultiServerHookPlugin extends JavaPlugin {
     private BukkitTask jdaHookWatcherTask;
     private final AtomicBoolean jdaHooked = new AtomicBoolean(false);
     private final AtomicBoolean secondaryStopRequested = new AtomicBoolean(false);
+    private final AtomicBoolean commandBatchInFlight = new AtomicBoolean(false);
 
     @Override
     public void onEnable() {
@@ -127,22 +129,40 @@ public final class MultiServerHookPlugin extends JavaPlugin {
 
         // 4. Start command queue listener for target servers.
         this.commandQueueTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
+            if (!this.commandBatchInFlight.compareAndSet(false, true)) {
+                return;
+            }
             try {
                 List<CommandQueueStore.QueuedCommand> list = this.commandQueueStore.pollPending(this.config.getServerName());
-                for (CommandQueueStore.QueuedCommand item : list) {
-                    Bukkit.getScheduler().runTask(this, () -> {
-                        try {
-                            this.getLogger().info("Executing queued command from Discord: " + item.command());
-                            Bukkit.dispatchCommand(Bukkit.getConsoleSender(), item.command());
-                            this.acknowledgeCommand(item);
-                        } catch (RuntimeException error) {
-                            this.getLogger().warning("Queued command failed; releasing claim for retry: "
-                                    + error.getMessage());
-                            this.releaseCommand(item);
-                        }
-                    });
+                if (list.isEmpty()) {
+                    this.commandBatchInFlight.set(false);
+                    return;
                 }
+
+                AtomicInteger remaining = new AtomicInteger(1);
+                for (CommandQueueStore.QueuedCommand item : list) {
+                    remaining.incrementAndGet();
+                    try {
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            try {
+                                this.getLogger().info("Executing queued command from Discord: " + item.command());
+                                if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), item.command())) {
+                                    throw new IllegalStateException("Bukkit rejected the command");
+                                }
+                                this.acknowledgeCommand(item, () -> this.finishCommandBatch(remaining));
+                            } catch (RuntimeException error) {
+                                this.getLogger().warning("Queued command failed; releasing claim for retry: "
+                                        + error.getMessage());
+                                this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
+                            }
+                        });
+                    } catch (RuntimeException error) {
+                        this.releaseCommand(item, () -> this.finishCommandBatch(remaining));
+                    }
+                }
+                this.finishCommandBatch(remaining);
             } catch (SQLException e) {
+                this.commandBatchInFlight.set(false);
                 this.getLogger().fine("Command queue poll exception: " + e.getMessage());
             }
         }, 20L, 20L); // every 1 second
@@ -151,7 +171,13 @@ public final class MultiServerHookPlugin extends JavaPlugin {
         this.startJdaHookWatcher(uxm);
     }
 
-    private void acknowledgeCommand(CommandQueueStore.QueuedCommand command) {
+    private void finishCommandBatch(AtomicInteger remaining) {
+        if (remaining.decrementAndGet() == 0) {
+            this.commandBatchInFlight.set(false);
+        }
+    }
+
+    private void acknowledgeCommand(CommandQueueStore.QueuedCommand command, Runnable onFinished) {
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             try {
                 if (!this.commandQueueStore.markExecuted(command)) {
@@ -159,16 +185,20 @@ public final class MultiServerHookPlugin extends JavaPlugin {
                 }
             } catch (SQLException e) {
                 this.getLogger().warning("Failed to acknowledge queued command " + command.id() + ": " + e.getMessage());
+            } finally {
+                onFinished.run();
             }
         });
     }
 
-    private void releaseCommand(CommandQueueStore.QueuedCommand command) {
+    private void releaseCommand(CommandQueueStore.QueuedCommand command, Runnable onFinished) {
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             try {
                 this.commandQueueStore.release(command);
             } catch (SQLException e) {
                 this.getLogger().warning("Failed to release queued command " + command.id() + ": " + e.getMessage());
+            } finally {
+                onFinished.run();
             }
         });
     }

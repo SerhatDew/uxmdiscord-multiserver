@@ -19,8 +19,9 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
-
 /**
  * Multi-server aware linking manager that replaces uxmDiscordSync's default LinkingManager.
  */
@@ -34,6 +35,7 @@ public class HookLinkingManager extends LinkingManager {
     private final Map<UUID, Long> rateLimits = new ConcurrentHashMap<>();
     private BukkitTask deliveryTask;
     private BukkitTask cleanupTask;
+    private final AtomicBoolean deliveryBatchInFlight = new AtomicBoolean(false);
 
     public HookLinkingManager(UXMDiscordSync plugin,
                               NetworkLinkStore linkStore,
@@ -57,45 +59,77 @@ public class HookLinkingManager extends LinkingManager {
 
     private void startDeliveryTask(Plugin hookPlugin) {
         this.deliveryTask = Bukkit.getScheduler().runTaskTimerAsynchronously(hookPlugin, () -> {
-            try {
-                List<NetworkLinkStore.Delivery> pending = this.linkStore.pending(this.serverName);
-                if (pending.isEmpty()) {
-                    return;
-                }
-
-                for (NetworkLinkStore.Delivery delivery : pending) {
-                    UUID uuid = delivery.account().getMinecraftUUID();
-                    Player player = Bukkit.getPlayer(uuid);
-                    if (player == null || !player.isOnline()) {
-                        continue;
-                    }
-
-                    String claimToken = this.linkStore.claimWithToken(delivery.code(), this.serverName);
-                    if (claimToken != null) {
-                        this.logger.info("Claimed link delivery for online player: " + player.getName());
-                        Bukkit.getScheduler().runTask(this.plugin, () -> {
-                            if (!player.isOnline()) {
-                                this.releaseDelivery(delivery.code(), claimToken);
-                                return;
-                            }
-                            try {
-                                this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked());
-                                this.acknowledgeDelivery(delivery.code(), claimToken);
-                            } catch (RuntimeException error) {
-                                this.logger.warning("Link reward delivery failed for " + player.getName()
-                                        + "; releasing claim: " + error.getMessage());
-                                this.releaseDelivery(delivery.code(), claimToken);
-                            }
-                        });
-                    }
-                }
-            } catch (SQLException e) {
-                this.logger.warning("Error during pending link delivery check: " + e.getMessage());
+            if (!this.deliveryBatchInFlight.compareAndSet(false, true)) {
+                return;
             }
+
+            List<NetworkLinkStore.Delivery> pending;
+            try {
+                pending = this.linkStore.pending(this.serverName);
+            } catch (SQLException e) {
+                this.deliveryBatchInFlight.set(false);
+                this.logger.warning("Error during pending link delivery check: " + e.getMessage());
+                return;
+            }
+            if (pending.isEmpty()) {
+                this.deliveryBatchInFlight.set(false);
+                return;
+            }
+
+            AtomicInteger remaining = new AtomicInteger(1);
+            for (NetworkLinkStore.Delivery delivery : pending) {
+                UUID uuid = delivery.account().getMinecraftUUID();
+                Player player = Bukkit.getPlayer(uuid);
+                if (player == null || !player.isOnline()) {
+                    continue;
+                }
+
+                String claimToken;
+                try {
+                    claimToken = this.linkStore.claimWithToken(delivery.code(), this.serverName);
+                } catch (SQLException e) {
+                    this.logger.warning("Failed to claim link delivery " + delivery.code() + ": " + e.getMessage());
+                    continue;
+                }
+                if (claimToken == null) {
+                    continue;
+                }
+
+                remaining.incrementAndGet();
+                this.logger.info("Claimed link delivery for online player: " + player.getName());
+                try {
+                    Bukkit.getScheduler().runTask(this.plugin, () -> {
+                        if (!player.isOnline()) {
+                            this.releaseDelivery(delivery.code(), claimToken, () -> this.finishDeliveryBatch(remaining));
+                            return;
+                        }
+                        try {
+                            this.deliverLinkRewards(player, delivery.account(), delivery.previouslyLinked());
+                            this.acknowledgeDelivery(delivery.code(), claimToken,
+                                    () -> this.finishDeliveryBatch(remaining));
+                        } catch (RuntimeException error) {
+                            this.logger.warning("Link reward delivery failed for " + player.getName()
+                                    + "; releasing claim: " + error.getMessage());
+                            this.releaseDelivery(delivery.code(), claimToken,
+                                    () -> this.finishDeliveryBatch(remaining));
+                        }
+                    });
+                } catch (RuntimeException error) {
+                    this.releaseDelivery(delivery.code(), claimToken,
+                            () -> this.finishDeliveryBatch(remaining));
+                }
+            }
+            this.finishDeliveryBatch(remaining);
         }, 20L, 20L); // every 1 second
     }
 
-    private void acknowledgeDelivery(String code, String claimToken) {
+    private void finishDeliveryBatch(AtomicInteger remaining) {
+        if (remaining.decrementAndGet() == 0) {
+            this.deliveryBatchInFlight.set(false);
+        }
+    }
+
+    private void acknowledgeDelivery(String code, String claimToken, Runnable onFinished) {
         Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
             try {
                 if (!this.linkStore.complete(code, this.serverName, claimToken)) {
@@ -103,16 +137,20 @@ public class HookLinkingManager extends LinkingManager {
                 }
             } catch (SQLException e) {
                 this.logger.warning("Failed to acknowledge link delivery " + code + ": " + e.getMessage());
+            } finally {
+                onFinished.run();
             }
         });
     }
 
-    private void releaseDelivery(String code, String claimToken) {
+    private void releaseDelivery(String code, String claimToken, Runnable onFinished) {
         Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
             try {
                 this.linkStore.release(code, this.serverName, claimToken);
             } catch (SQLException e) {
                 this.logger.warning("Failed to release link delivery " + code + ": " + e.getMessage());
+            } finally {
+                onFinished.run();
             }
         });
     }
