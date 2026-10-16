@@ -188,7 +188,9 @@ public final class MultiServerHookPlugin extends JavaPlugin {
 
                 if (!MultiServerHookPlugin.this.config.isCoordinator()) {
                     var discordBot = uxm.getDiscordBot();
-                    if (discordBot != null && discordBot.getJDA() != null
+                    var jda = discordBot == null ? null : discordBot.getJDA();
+                    if (jda != null && jda.getStatus() != JDA.Status.SHUTDOWN
+                            && jda.getStatus() != JDA.Status.SHUTTING_DOWN
                             && MultiServerHookPlugin.this.secondaryStopRequested.compareAndSet(false, true)) {
                         Bukkit.getScheduler().runTaskAsynchronously(MultiServerHookPlugin.this, () -> {
                             try {
